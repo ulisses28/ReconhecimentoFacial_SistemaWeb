@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless architecture for facial recognition (ingest -> S3 -> SQS -> Lambda -> Rekognition -> DynamoDB)
+
+Globals:
+  Function:
+    Timeout: 60
+    Runtime: python3.11
+    MemorySize: 512
+
+Resources:
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: "ExpireUploads"
+            Status: "Enabled"
+            ExpirationInDays: 7
+
+  SQSFailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: falhas_processamento
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  SQSMainQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: fotos_para_processar
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SQSFailQueue.Arn
+        maxReceiveCount: 3
+
+  SQSResultsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: resultados_processados
+
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: results_table
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: facial-notifications
+
+  LambdaIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda_ingest
+      Handler: app.lambda_handler
+      CodeUri: backend/lambda_ingest/
+      Policies:
+        - S3Crud:
+            BucketName: !Ref UploadsBucket
+        - SQSWritePolicy:
+            QueueName: !GetAtt SQSMainQueue.QueueName
+      Environment:
+        Variables:
+          BUCKET: !Ref UploadsBucket
+          SQS_URL: !Ref SQSMainQueue
+      Events:
+        ApiIngest:
+          Type: Api
+          Properties:
+            Path: /ingest
+            Method: post
+
+  LambdaProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda_process
+      Handler: app.lambda_handler
+      CodeUri: backend/lambda_process/
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadsBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt SQSMainQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResultsTable
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:DetectFaces
+              Resource: "*"
+        - SNSPublishMessagePolicy:
+            TopicName: !Ref NotificationsTopic
+      Environment:
+        Variables:
+          BUCKET: !Ref UploadsBucket
+          DDB_TABLE: !Ref ResultsTable
+          SQS_RESULTS_URL: !Ref SQSResultsQueue
+          SNS_TOPIC_ARN: !Ref NotificationsTopic
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSMainQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+  SQSMainQueueUrl:
+    Value: !Ref SQSMainQueue
+  ResultsTableName:
+    Value: !Ref ResultsTable
+
